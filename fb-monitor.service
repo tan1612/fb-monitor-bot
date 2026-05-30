@@ -1,0 +1,16 @@
+[Unit]
+Description=Facebook Monitor Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/fb_monitor_bot
+Environment="BOT_TOKEN=YOUR_BOT_TOKEN_HERE"
+Environment="CHECK_INTERVAL=60"
+ExecStart=/opt/fb_monitor_bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
