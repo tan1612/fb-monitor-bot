@@ -22,6 +22,14 @@ class FacebookChecker:
         "Trang này không khả dụng",
         "Nội dung này không khả dụng",
         "Sorry, this page isn't available",
+        # Tài khoản bị khóa / riêng tư / không tồn tại
+        "Bạn hiện không xem được nội dung này",
+        "You can't view this content",
+        "This account has been disabled",
+        "Tài khoản này đã bị vô hiệu hóa",
+        "content isn't available right now",
+        "profile is not available",
+        "this page isn't available",
     ]
 
     def extract_id(self, raw: str) -> str | None:
