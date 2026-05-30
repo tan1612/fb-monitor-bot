@@ -2,7 +2,6 @@ import re
 import httpx
 from urllib.parse import urlparse
 
-
 class FacebookChecker:
     HEADERS = {
         "User-Agent": (
@@ -15,6 +14,7 @@ class FacebookChecker:
     }
 
     DIE_PATTERNS = [
+        # Lỗi không tồn tại / vô hiệu hóa
         "This content isn't available",
         "This page isn't available",
         "content not found",
@@ -22,7 +22,6 @@ class FacebookChecker:
         "Trang này không khả dụng",
         "Nội dung này không khả dụng",
         "Sorry, this page isn't available",
-        # Tài khoản bị khóa / riêng tư / không tồn tại
         "Bạn hiện không xem được nội dung này",
         "You can't view this content",
         "This account has been disabled",
@@ -30,6 +29,13 @@ class FacebookChecker:
         "content isn't available right now",
         "profile is not available",
         "this page isn't available",
+        
+        # Bị ép ra trang đăng nhập
+        "đăng nhập hoặc đăng ký",
+        "log in or sign up",
+        "facebook login",
+        "đăng nhập vào facebook",
+        "log into facebook"
     ]
 
     def extract_id(self, raw: str) -> str | None:
@@ -49,27 +55,38 @@ class FacebookChecker:
         return None
 
     async def check(self, fb_id: str) -> tuple[str, str | None]:
-        url = f"https://www.facebook.com/{fb_id}"
+        # Sử dụng mbasic để nhẹ hơn và hạn chế dính script chặn bot
+        url = f"https://mbasic.facebook.com/{fb_id}"
+        
         try:
             async with httpx.AsyncClient(
                 headers=self.HEADERS, follow_redirects=True, timeout=15.0
             ) as client:
                 response = await client.get(url)
 
+            # 1. BẮT LỖI CHUYỂN HƯỚNG (REDIRECT)
+            # Nếu UID die/khóa, FB sẽ đẩy về URL có chứa 'login' hoặc 'checkpoint'
+            final_url = str(response.url).lower()
+            if "login" in final_url or "checkpoint" in final_url:
+                return "die", None
+
+            # 2. BẮT LỖI HTTP 404
             if response.status_code == 404:
                 return "die", None
 
+            # 3. BẮT LỖI QUA TEXT TRONG HTML
             body = response.text
             for pattern in self.DIE_PATTERNS:
                 if pattern.lower() in body.lower():
                     return "die", None
 
+            # Nếu vượt qua hết các lớp bảo vệ trên -> TÀI KHOẢN LIVE
             display_name = self._extract_title(body)
             return "live", display_name
 
         except httpx.TimeoutException:
             return "unknown", None
-        except Exception:
+        except Exception as e:
             return "unknown", None
 
     async def get_avatar_url(self, fb_id: str) -> str | None:
