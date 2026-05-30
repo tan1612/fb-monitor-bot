@@ -2,6 +2,7 @@ import re
 import httpx
 from urllib.parse import urlparse
 
+
 class FacebookChecker:
     HEADERS = {
         "User-Agent": (
@@ -14,7 +15,7 @@ class FacebookChecker:
     }
 
     DIE_PATTERNS = [
-        # Lỗi không tồn tại / vô hiệu hóa
+        # Thông báo lỗi / không tồn tại / vô hiệu hóa
         "This content isn't available",
         "This page isn't available",
         "content not found",
@@ -30,12 +31,13 @@ class FacebookChecker:
         "profile is not available",
         "this page isn't available",
         
-        # Bị ép ra trang đăng nhập
+        # Các pattern nhận diện trang đăng nhập (bị ép văng ra ngoài)
         "đăng nhập hoặc đăng ký",
         "log in or sign up",
         "facebook login",
         "đăng nhập vào facebook",
-        "log into facebook"
+        "log into facebook",
+        "bạn phải đăng nhập để tiếp tục"
     ]
 
     def extract_id(self, raw: str) -> str | None:
@@ -55,7 +57,7 @@ class FacebookChecker:
         return None
 
     async def check(self, fb_id: str) -> tuple[str, str | None]:
-        # Sử dụng mbasic để nhẹ hơn và hạn chế dính script chặn bot
+        # Dùng mbasic.facebook.com để lướt nhẹ hơn và hạn chế script chặn bot
         url = f"https://mbasic.facebook.com/{fb_id}"
         
         try:
@@ -64,29 +66,43 @@ class FacebookChecker:
             ) as client:
                 response = await client.get(url)
 
-            # 1. BẮT LỖI CHUYỂN HƯỚNG (REDIRECT)
-            # Nếu UID die/khóa, FB sẽ đẩy về URL có chứa 'login' hoặc 'checkpoint'
             final_url = str(response.url).lower()
+            
+            # 1. BẮT LỖI BỊ ÉP CHUYỂN HƯỚNG RA TRANG LOGIN HOẶC CHECKPOINT
             if "login" in final_url or "checkpoint" in final_url:
+                # Kích hoạt cơ chế Check chéo (Fallback) thông qua Graph API
+                api_url = f"https://graph.facebook.com/{fb_id}/picture?type=large&redirect=false"
+                try:
+                    api_resp = await client.get(api_url)
+                    if api_resp.status_code == 200:
+                        data = api_resp.json()
+                        # Nếu API vẫn trả về dữ liệu ảnh (Nick vẫn tồn tại) -> Báo Live
+                        if data.get("data", {}).get("url"):
+                            return "live", None
+                except Exception:
+                    pass
+                
+                # Nếu API phụ cũng lỗi 404/400 -> Nick thật sự đã Die
                 return "die", None
 
-            # 2. BẮT LỖI HTTP 404
+            # 2. BẮT LỖI MÃ HTTP 404
             if response.status_code == 404:
                 return "die", None
 
-            # 3. BẮT LỖI QUA TEXT TRONG HTML
+            # 3. QUÉT TEXT TÌM CÁC THÔNG BÁO LỖI (Dựa theo DIE_PATTERNS)
             body = response.text
             for pattern in self.DIE_PATTERNS:
                 if pattern.lower() in body.lower():
                     return "die", None
 
-            # Nếu vượt qua hết các lớp bảo vệ trên -> TÀI KHOẢN LIVE
+            # 4. NẾU VƯỢT QUA TẤT CẢ -> TÀI KHOẢN ĐANG LIVE
             display_name = self._extract_title(body)
             return "live", display_name
 
         except httpx.TimeoutException:
+            # Lỗi mạng nội bộ hoặc nghẽn mạng -> Trả về unknown để bot quét lại sau
             return "unknown", None
-        except Exception as e:
+        except Exception:
             return "unknown", None
 
     async def get_avatar_url(self, fb_id: str) -> str | None:
