@@ -4,11 +4,6 @@ from urllib.parse import urlparse
 
 
 class FacebookChecker:
-    """
-    Kiểm tra trạng thái public của Facebook profile/page
-    bằng cách gọi URL public (không cần đăng nhập).
-    """
-
     HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -19,7 +14,6 @@ class FacebookChecker:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    # Dấu hiệu trang bị xóa / không tồn tại
     DIE_PATTERNS = [
         "This content isn't available",
         "This page isn't available",
@@ -31,70 +25,38 @@ class FacebookChecker:
     ]
 
     def extract_id(self, raw: str) -> str | None:
-        """
-        Trích xuất Facebook ID hoặc username từ URL hoặc chuỗi thô.
-        Hỗ trợ:
-          - 100012345678
-          - zuck
-          - https://facebook.com/zuck
-          - https://www.facebook.com/profile.php?id=100012345678
-          - fb.com/zuck
-        """
         raw = raw.strip().strip("/")
-
-        # Nếu là URL
         if "facebook.com" in raw or "fb.com" in raw:
             parsed = urlparse(raw if raw.startswith("http") else "https://" + raw)
             path = parsed.path.strip("/")
-
-            # profile.php?id=XXXXXXX
             if "profile.php" in parsed.path:
                 match = re.search(r"id=(\d+)", parsed.query)
                 if match:
                     return match.group(1)
-
-            # facebook.com/username
             if path and "/" not in path:
                 return path
-
             return None
-
-        # Thuần số hoặc username
         if re.match(r"^[\w.]+$", raw):
             return raw
-
         return None
 
     async def check(self, fb_id: str) -> tuple[str, str | None]:
-        """
-        Kiểm tra một Facebook ID.
-        Trả về: ("live" | "die", display_name | None)
-        """
         url = f"https://www.facebook.com/{fb_id}"
-
         try:
             async with httpx.AsyncClient(
-                headers=self.HEADERS,
-                follow_redirects=True,
-                timeout=15.0
+                headers=self.HEADERS, follow_redirects=True, timeout=15.0
             ) as client:
                 response = await client.get(url)
 
-            status_code = response.status_code
-            body = response.text
-
-            # 404 rõ ràng
-            if status_code == 404:
+            if response.status_code == 404:
                 return "die", None
 
-            # Check các pattern "không tồn tại" trong body
+            body = response.text
             for pattern in self.DIE_PATTERNS:
                 if pattern.lower() in body.lower():
                     return "die", None
 
-            # Trích tên hiển thị từ <title>
             display_name = self._extract_title(body)
-
             return "live", display_name
 
         except httpx.TimeoutException:
@@ -102,12 +64,36 @@ class FacebookChecker:
         except Exception:
             return "unknown", None
 
+    async def get_avatar_url(self, fb_id: str) -> str | None:
+        """Lấy URL ảnh avatar từ graph.facebook.com (public, không cần token)."""
+        try:
+            url = f"https://graph.facebook.com/{fb_id}/picture?type=large&redirect=false"
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("data", {}).get("url"):
+                    return data["data"]["url"]
+        except Exception:
+            pass
+        # fallback: redirect URL
+        return f"https://graph.facebook.com/{fb_id}/picture?type=large"
+
+    async def get_profile_info(self, fb_id: str) -> dict:
+        """Lấy thông tin public profile."""
+        status, name = await self.check(fb_id)
+        avatar_url = await self.get_avatar_url(fb_id)
+        return {
+            "status": status,
+            "name": name,
+            "avatar_url": avatar_url,
+            "profile_url": f"https://facebook.com/{fb_id}",
+        }
+
     def _extract_title(self, html: str) -> str | None:
-        """Trích tên từ thẻ <title>."""
         match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
         if match:
             title = match.group(1).strip()
-            # Bỏ phần "| Facebook" ở cuối
             title = re.sub(r"\s*[|\-]\s*Facebook.*$", "", title, flags=re.IGNORECASE)
             if title and title.lower() not in ("facebook", ""):
                 return title.strip()

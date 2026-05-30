@@ -11,18 +11,24 @@ class Database:
         with sqlite3.connect(self.path) as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS accounts (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     fb_id       TEXT NOT NULL,
                     user_id     INTEGER NOT NULL,
-                    name        TEXT,
+                    note        TEXT DEFAULT '',
+                    price       TEXT DEFAULT '',
+                    deadline    TEXT DEFAULT 'Vĩnh viễn',
                     status      TEXT DEFAULT 'unknown',
+                    monitoring  INTEGER DEFAULT 1,
+                    done        INTEGER DEFAULT 0,
                     last_check  TEXT,
                     added_at    TEXT NOT NULL,
-                    PRIMARY KEY (fb_id, user_id)
+                    UNIQUE(fb_id, user_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS status_log (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     fb_id       TEXT NOT NULL,
+                    user_id     INTEGER NOT NULL,
                     old_status  TEXT,
                     new_status  TEXT,
                     changed_at  TEXT NOT NULL
@@ -30,80 +36,90 @@ class Database:
             """)
         print("✅ Database initialized")
 
-    def add_account(self, fb_id: str, name: str, status: str, user_id: int) -> bool:
-        """Thêm account. Trả về True nếu thêm mới, False nếu đã tồn tại."""
+    # ── CRUD ──────────────────────────────────────────────────────────────
+
+    def add_account(self, fb_id, user_id, note="", price="", deadline="Vĩnh viễn", status="unknown") -> bool:
         try:
             with sqlite3.connect(self.path) as conn:
                 conn.execute(
-                    "INSERT INTO accounts (fb_id, user_id, name, status, added_at) VALUES (?, ?, ?, ?, ?)",
-                    (fb_id, user_id, name, status, datetime.now().isoformat())
+                    "INSERT INTO accounts (fb_id, user_id, note, price, deadline, status, added_at) VALUES (?,?,?,?,?,?,?)",
+                    (fb_id, user_id, note, price, deadline, status, datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
                 )
             return True
         except sqlite3.IntegrityError:
             return False
 
+    def get_account(self, fb_id: str, user_id: int) -> dict | None:
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE fb_id=? AND user_id=?", (fb_id, user_id)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_account_by_id(self, account_id: int) -> dict | None:
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_accounts(self, user_id: int) -> list[dict]:
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE user_id=? ORDER BY added_at DESC", (user_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_monitoring(self) -> list[dict]:
+        with sqlite3.connect(self.path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE monitoring=1"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_account(self, account_id: int, **kwargs):
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [account_id]
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(f"UPDATE accounts SET {sets} WHERE id=?", vals)
+
     def remove_account(self, fb_id: str, user_id: int) -> bool:
         with sqlite3.connect(self.path) as conn:
             cur = conn.execute(
-                "DELETE FROM accounts WHERE fb_id = ? AND user_id = ?",
-                (fb_id, user_id)
+                "DELETE FROM accounts WHERE fb_id=? AND user_id=?", (fb_id, user_id)
             )
             return cur.rowcount > 0
 
-    def get_accounts(self, user_id: int) -> list:
-        """Lấy danh sách accounts của một user."""
+    def toggle_monitoring(self, account_id: int) -> bool:
+        """Toggle monitoring on/off. Returns new state."""
         with sqlite3.connect(self.path) as conn:
-            rows = conn.execute(
-                "SELECT fb_id, name, status, last_check, added_at FROM accounts WHERE user_id = ? ORDER BY added_at DESC",
-                (user_id,)
-            ).fetchall()
-        return rows
+            row = conn.execute("SELECT monitoring FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if not row:
+                return False
+            new_val = 0 if row[0] else 1
+            conn.execute("UPDATE accounts SET monitoring=? WHERE id=?", (new_val, account_id))
+        return bool(new_val)
 
-    def get_all_accounts(self) -> list:
-        """Lấy tất cả accounts cho monitor loop."""
+    def set_done(self, account_id: int, done: bool):
         with sqlite3.connect(self.path) as conn:
-            rows = conn.execute(
-                "SELECT fb_id, name, status, user_id FROM accounts"
-            ).fetchall()
-        return rows
+            conn.execute("UPDATE accounts SET done=? WHERE id=?", (int(done), account_id))
 
-    def update_status(self, fb_id: str, status: str, name: str = None):
-        with sqlite3.connect(self.path) as conn:
-            if name:
-                conn.execute(
-                    "UPDATE accounts SET status = ?, name = ?, last_check = ? WHERE fb_id = ?",
-                    (status, name, datetime.now().isoformat(), fb_id)
-                )
-            else:
-                conn.execute(
-                    "UPDATE accounts SET status = ?, last_check = ? WHERE fb_id = ?",
-                    (status, datetime.now().isoformat(), fb_id)
-                )
-
-    def update_last_check(self, fb_id: str):
+    def log_change(self, fb_id: str, user_id: int, old_status: str, new_status: str):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
-                "UPDATE accounts SET last_check = ? WHERE fb_id = ?",
-                (datetime.now().isoformat(), fb_id)
+                "INSERT INTO status_log (fb_id, user_id, old_status, new_status, changed_at) VALUES (?,?,?,?,?)",
+                (fb_id, user_id, old_status, new_status, datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
             )
 
-    def log_change(self, fb_id: str, old_status: str, new_status: str):
+    def get_stats(self, user_id: int) -> dict:
         with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "INSERT INTO status_log (fb_id, old_status, new_status, changed_at) VALUES (?, ?, ?, ?)",
-                (fb_id, old_status, new_status, datetime.now().isoformat())
-            )
-
-    def get_stats(self, user_id: int) -> tuple:
-        """Trả về (total, live, die)."""
-        with sqlite3.connect(self.path) as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM accounts WHERE user_id = ?", (user_id,)
-            ).fetchone()[0]
-            live = conn.execute(
-                "SELECT COUNT(*) FROM accounts WHERE user_id = ? AND status = 'live'", (user_id,)
-            ).fetchone()[0]
-            die = conn.execute(
-                "SELECT COUNT(*) FROM accounts WHERE user_id = ? AND status = 'die'", (user_id,)
-            ).fetchone()[0]
-        return total, live, die
+            total  = conn.execute("SELECT COUNT(*) FROM accounts WHERE user_id=?", (user_id,)).fetchone()[0]
+            live   = conn.execute("SELECT COUNT(*) FROM accounts WHERE user_id=? AND status='live'", (user_id,)).fetchone()[0]
+            die    = conn.execute("SELECT COUNT(*) FROM accounts WHERE user_id=? AND status='die'", (user_id,)).fetchone()[0]
+            done   = conn.execute("SELECT COUNT(*) FROM accounts WHERE user_id=? AND done=1", (user_id,)).fetchone()[0]
+            mon    = conn.execute("SELECT COUNT(*) FROM accounts WHERE user_id=? AND monitoring=1", (user_id,)).fetchone()[0]
+        return {"total": total, "live": live, "die": die, "done": done, "monitoring": mon}

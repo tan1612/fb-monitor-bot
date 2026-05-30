@@ -1,250 +1,466 @@
 import asyncio
 import logging
-import sqlite3
 import httpx
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, ConversationHandler, filters
 )
+from telegram.constants import ParseMode
 from config import BOT_TOKEN, CHECK_INTERVAL, ADMIN_IDS
 from database import Database
 from checker import FacebookChecker
+from ui import (
+    format_account_card, account_keyboard, list_keyboard,
+    main_menu_keyboard, status_emoji, status_label
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
 db = Database()
 checker = FacebookChecker()
 
+# ConversationHandler states
+ASK_UID, ASK_NOTE, ASK_PRICE, ASK_DEADLINE = range(4)
+ASK_UPDATE_FIELD, ASK_UPDATE_VALUE = range(4, 6)
+
 
 # ─── HELPERS ────────────────────────────────────────────────────────────────
 
-def status_emoji(status: str) -> str:
-    return "🟢" if status == "live" else "🔴"
-
-
-def is_admin(user_id: int) -> bool:
+def is_allowed(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
-# ─── COMMANDS ───────────────────────────────────────────────────────────────
+async def send_account_card(
+    bot, chat_id: int, acc: dict,
+    photo_url: str | None = None,
+    message_id: int | None = None
+):
+    """Gửi hoặc edit card thông tin account."""
+    text = format_account_card(acc)
+    keyboard = account_keyboard(acc["id"], bool(acc["monitoring"]), bool(acc["done"]))
+
+    if photo_url:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_url,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
+
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=text, parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
+
+    await bot.send_message(
+        chat_id=chat_id, text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+
+# ─── /start ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👁 *FB Monitor Bot*\n\n"
-        "Bot theo dõi trạng thái tài khoản Facebook theo thời gian thực.\n\n"
-        "*Lệnh:*\n"
-        "• `/add <id_hoac_url>` — Thêm ID vào danh sách theo dõi\n"
-        "• `/remove <id>` — Xóa ID khỏi danh sách\n"
-        "• `/list` — Xem danh sách đang theo dõi\n"
-        "• `/check <id>` — Kiểm tra ngay một ID\n"
-        "• `/checkall` — Kiểm tra tất cả ngay\n"
-        "• `/status` — Thống kê tổng quan\n"
-        "• `/help` — Hiển thị trợ giúp\n\n"
-        f"⏱ Tự động check mỗi *{CHECK_INTERVAL // 60} phút*"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, context)
-
-
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Cú pháp: `/add <facebook_id_hoac_url>`\n\n"
-            "Ví dụ:\n"
-            "• `/add 100012345678`\n"
-            "• `/add zuck`\n"
-            "• `/add https://facebook.com/zuck`",
-            parse_mode="Markdown"
-        )
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("❌ Bạn không có quyền dùng bot này.")
         return
-
-    raw = context.args[0].strip()
-    fb_id = checker.extract_id(raw)
-
-    if not fb_id:
-        await update.message.reply_text("❌ Không thể đọc được ID/URL này. Vui lòng thử lại.")
-        return
-
-    user_id = update.effective_user.id
-    msg = await update.message.reply_text(f"🔍 Đang kiểm tra `{fb_id}`...", parse_mode="Markdown")
-
-    status, display_name = await checker.check(fb_id)
-
-    if db.add_account(fb_id, display_name, status, user_id):
-        emoji = status_emoji(status)
-        await msg.edit_text(
-            f"✅ Đã thêm vào danh sách theo dõi!\n\n"
-            f"{emoji} `{fb_id}` — *{display_name}*\n"
-            f"Trạng thái hiện tại: *{'LIVE' if status == 'live' else 'DIE'}*",
-            parse_mode="Markdown"
-        )
-    else:
-        await msg.edit_text(f"⚠️ `{fb_id}` đã có trong danh sách theo dõi rồi.", parse_mode="Markdown")
-
-
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Cú pháp: `/remove <facebook_id>`", parse_mode="Markdown")
-        return
-
-    fb_id = context.args[0].strip()
-    user_id = update.effective_user.id
-
-    if db.remove_account(fb_id, user_id):
-        await update.message.reply_text(f"🗑 Đã xóa `{fb_id}` khỏi danh sách.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ Không tìm thấy `{fb_id}` trong danh sách của bạn.", parse_mode="Markdown")
-
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    accounts = db.get_accounts(user_id)
-
-    if not accounts:
-        await update.message.reply_text(
-            "📭 Danh sách trống.\n\nDùng `/add <id>` để thêm tài khoản theo dõi.",
-            parse_mode="Markdown"
-        )
-        return
-
-    lines = ["📋 *Danh sách theo dõi:*\n"]
-    for acc in accounts:
-        fb_id, name, status, last_check, added_at = acc
-        emoji = status_emoji(status)
-        last = last_check[:16] if last_check else "Chưa check"
-        lines.append(f"{emoji} `{fb_id}` — *{name or fb_id}*\n   └ Check lúc: {last}")
-
-    lines.append(f"\n_Tổng: {len(accounts)} tài khoản_")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Cú pháp: `/check <facebook_id>`", parse_mode="Markdown")
-        return
-
-    raw = context.args[0].strip()
-    fb_id = checker.extract_id(raw)
-
-    if not fb_id:
-        await update.message.reply_text("❌ ID không hợp lệ.")
-        return
-
-    msg = await update.message.reply_text(f"🔍 Đang kiểm tra `{fb_id}`...", parse_mode="Markdown")
-    status, display_name = await checker.check(fb_id)
-    emoji = status_emoji(status)
-
-    await msg.edit_text(
-        f"{emoji} *{display_name or fb_id}*\n"
-        f"ID: `{fb_id}`\n"
-        f"Trạng thái: *{'✅ LIVE' if status == 'live' else '❌ DIE'}*\n"
-        f"Thời gian: {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_checkall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    accounts = db.get_accounts(user_id)
-
-    if not accounts:
-        await update.message.reply_text("📭 Danh sách trống.")
-        return
-
-    msg = await update.message.reply_text(f"🔄 Đang kiểm tra {len(accounts)} tài khoản...")
-
-    results = []
-    for acc in accounts:
-        fb_id, name, old_status, *_ = acc
-        status, display_name = await checker.check(fb_id)
-        changed = status != old_status
-        db.update_status(fb_id, status, display_name)
-        results.append((fb_id, display_name or name or fb_id, status, changed))
-        await asyncio.sleep(0.5)
-
-    lines = ["📊 *Kết quả kiểm tra:*\n"]
-    for fb_id, name, status, changed in results:
-        emoji = status_emoji(status)
-        change_tag = " _(đổi)_" if changed else ""
-        lines.append(f"{emoji} `{fb_id}` — {name}{change_tag}")
-
-    lines.append(f"\n_Cập nhật lúc: {datetime.now().strftime('%H:%M %d/%m/%Y')}_")
-    await msg.edit_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    total, live, die = db.get_stats(user_id)
 
     await update.message.reply_text(
-        f"📈 *Thống kê của bạn:*\n\n"
-        f"📋 Tổng theo dõi: *{total}*\n"
-        f"🟢 Live: *{live}*\n"
-        f"🔴 Die: *{die}*\n\n"
-        f"⏱ Check interval: *{CHECK_INTERVAL // 60} phút*",
-        parse_mode="Markdown"
+        "👁 <b>FB Monitor Bot</b>\n\n"
+        "Bot theo dõi trạng thái tài khoản Facebook 24/7.\n"
+        "Tự động thông báo khi Live ↔ Die.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard()
     )
 
 
-# ─── BACKGROUND MONITOR ─────────────────────────────────────────────────────
+# ─── ADD FLOW (ConversationHandler) ─────────────────────────────────────────
+
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bắt đầu flow thêm UID — dùng được từ cả /add lẫn callback."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        await query.message.reply_text(
+            "👤 <b>Thêm Profile Facebook</b>\n\n"
+            "<b>Định dạng:</b>\n"
+            "<code>UID | Ghi chú | Giá | Thời hạn</code>\n\n"
+            "<b>Thời hạn:</b> <code>30p</code> (phút), <code>7d</code> (ngày)\n"
+            "Không nhập = vĩnh viễn\n\n"
+            "<b>Ví dụ:</b>\n"
+            "<code>100012345678 | Khánh | 500000 | 1d</code>\n"
+            "<code>/add 100012345678 | Khánh | 500000 | 1d</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Quay lại Menu", callback_data="menu")
+            ]])
+        )
+    else:
+        if context.args:
+            # /add với args inline
+            raw = " ".join(context.args)
+            return await _process_add(update, context, raw)
+
+        await update.message.reply_text(
+            "👤 <b>Thêm Profile Facebook</b>\n\n"
+            "<b>Định dạng:</b>\n"
+            "<code>UID | Ghi chú | Giá | Thời hạn</code>\n\n"
+            "<b>Ví dụ:</b>\n"
+            "<code>100012345678 | Khánh | 500000 | 1d</code>",
+            parse_mode=ParseMode.HTML
+        )
+    return ASK_UID
+
+
+async def add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Nhận input từ user sau khi hỏi."""
+    return await _process_add(update, context, update.message.text.strip())
+
+
+async def _process_add(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str):
+    parts = [p.strip() for p in raw.split("|")]
+    fb_raw = parts[0]
+    note     = parts[1] if len(parts) > 1 else ""
+    price    = parts[2] if len(parts) > 2 else ""
+    deadline = parts[3] if len(parts) > 3 else "Vĩnh viễn"
+
+    fb_id = checker.extract_id(fb_raw)
+    if not fb_id:
+        await update.message.reply_text("❌ UID/URL không hợp lệ. Thử lại:")
+        return ASK_UID
+
+    user_id = update.effective_user.id
+    msg = await update.message.reply_text(f"🔍 Đang kiểm tra <code>{fb_id}</code>...", parse_mode=ParseMode.HTML)
+
+    status, name = await checker.check(fb_id)
+
+    added = db.add_account(fb_id, user_id, note, price, deadline, status)
+    if not added:
+        await msg.edit_text(f"⚠️ <code>{fb_id}</code> đã có trong danh sách rồi.", parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+
+    acc = db.get_account(fb_id, user_id)
+    if name:
+        db.update_account(acc["id"], status=status)
+        acc = db.get_account(fb_id, user_id)
+
+    await msg.delete()
+
+    # Lấy avatar và gửi card
+    avatar_url = await checker.get_avatar_url(fb_id)
+    await send_account_card(context.bot, update.effective_chat.id, acc, photo_url=avatar_url)
+    return ConversationHandler.END
+
+
+async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Đã hủy.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+
+# ─── CALLBACK QUERIES ────────────────────────────────────────────────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+
+    # ── Menu ──
+    if data == "menu":
+        await query.message.reply_text(
+            "👁 <b>FB Monitor Bot</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+
+    # ── Danh sách ──
+    elif data == "list":
+        accounts = db.get_accounts(user_id)
+        if not accounts:
+            await query.message.reply_text(
+                "📭 Danh sách trống.\nDùng /add để thêm.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Thêm UID", callback_data="add_new")
+                ]])
+            )
+            return
+        await query.message.reply_text(
+            f"📋 <b>Danh sách UID</b> ({len(accounts)} tài khoản)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=list_keyboard(accounts)
+        )
+
+    # ── Xem chi tiết account ──
+    elif data.startswith("view:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            await query.message.reply_text("❌ Không tìm thấy.")
+            return
+        await send_account_card(context.bot, update.effective_chat.id, acc)
+
+    # ── Toggle monitoring ──
+    elif data.startswith("toggle_mon:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        new_state = db.toggle_monitoring(account_id)
+        acc = db.get_account_by_id(account_id)
+        state_text = "▶️ Đã BẬT theo dõi" if new_state else "⏸ Đã TẮT theo dõi"
+        await query.answer(state_text, show_alert=False)
+        # Edit caption hoặc text
+        try:
+            await query.edit_message_caption(
+                caption=format_account_card(acc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=account_keyboard(acc["id"], bool(acc["monitoring"]), bool(acc["done"]))
+            )
+        except Exception:
+            await query.edit_message_text(
+                text=format_account_card(acc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=account_keyboard(acc["id"], bool(acc["monitoring"]), bool(acc["done"]))
+            )
+
+    # ── Toggle done ──
+    elif data.startswith("toggle_done:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        new_done = not bool(acc["done"])
+        db.set_done(account_id, new_done)
+        acc = db.get_account_by_id(account_id)
+        await query.answer("✅ Done!" if new_done else "↩️ Bỏ Done")
+        try:
+            await query.edit_message_caption(
+                caption=format_account_card(acc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=account_keyboard(acc["id"], bool(acc["monitoring"]), bool(acc["done"]))
+            )
+        except Exception:
+            await query.edit_message_text(
+                text=format_account_card(acc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=account_keyboard(acc["id"], bool(acc["monitoring"]), bool(acc["done"]))
+            )
+
+    # ── Hiện thông tin / avatar ──
+    elif data.startswith("info:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        await query.answer("🔍 Đang lấy thông tin...")
+        status, name = await checker.check(acc["fb_id"])
+        avatar_url = await checker.get_avatar_url(acc["fb_id"])
+        if name:
+            db.update_account(account_id, status=status, last_check=datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+        acc = db.get_account_by_id(account_id)
+        await send_account_card(context.bot, update.effective_chat.id, acc, photo_url=avatar_url)
+
+    # ── Cập nhật ──
+    elif data.startswith("update:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        context.user_data["update_id"] = account_id
+        await query.message.reply_text(
+            f"✏️ <b>Cập nhật UID:</b> <code>{acc['fb_id']}</code>\n\n"
+            "Nhập thông tin mới theo định dạng:\n"
+            "<code>Ghi chú | Giá | Thời hạn</code>\n\n"
+            "Ví dụ: <code>Tên mới | 300000 | 7d</code>\n"
+            "Bỏ trống trường nào = giữ nguyên",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Hủy", callback_data=f"view:{account_id}")
+            ]])
+        )
+        return ASK_UPDATE_VALUE
+
+    # ── Hủy kèo ──
+    elif data.startswith("remove:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        await query.message.reply_text(
+            f"⚠️ Xác nhận xóa <code>{acc['fb_id']}</code>?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Xóa", callback_data=f"confirm_remove:{account_id}"),
+                    InlineKeyboardButton("❌ Hủy", callback_data=f"view:{account_id}"),
+                ]
+            ])
+        )
+
+    elif data.startswith("confirm_remove:"):
+        account_id = int(data.split(":")[1])
+        acc = db.get_account_by_id(account_id)
+        if not acc or acc["user_id"] != user_id:
+            return
+        db.remove_account(acc["fb_id"], user_id)
+        await query.message.reply_text(
+            f"🗑 Đã xóa <code>{acc['fb_id']}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+
+    # ── Thêm mới (callback) ──
+    elif data == "add_new":
+        await query.message.reply_text(
+            "👤 <b>Thêm Profile Facebook</b>\n\n"
+            "Nhập theo định dạng:\n"
+            "<code>UID | Ghi chú | Giá | Thời hạn</code>\n\n"
+            "<b>Thời hạn:</b> <code>30p</code>, <code>7d</code> — bỏ trống = vĩnh viễn\n\n"
+            "Ví dụ:\n"
+            "<code>100012345678 | Khánh | 500000 | 1d</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Quay lại Menu", callback_data="menu")
+            ]])
+        )
+        return ASK_UID
+
+    # ── Thống kê ──
+    elif data == "stats":
+        s = db.get_stats(user_id)
+        await query.message.reply_text(
+            f"📊 <b>Thống kê của bạn</b>\n\n"
+            f"📋 Tổng UID: <b>{s['total']}</b>\n"
+            f"🟢 Live: <b>{s['live']}</b>\n"
+            f"🔴 Die: <b>{s['die']}</b>\n"
+            f"✅ Done: <b>{s['done']}</b>\n"
+            f"🔄 Đang theo dõi: <b>{s['monitoring']}</b>\n\n"
+            f"⏱ Check interval: <b>{CHECK_INTERVAL // 60} phút</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+
+    # ── Check all ──
+    elif data == "checkall":
+        accounts = db.get_accounts(user_id)
+        if not accounts:
+            await query.message.reply_text("📭 Danh sách trống.")
+            return
+        msg = await query.message.reply_text(f"🔄 Đang kiểm tra {len(accounts)} tài khoản...")
+        results = []
+        for acc in accounts:
+            status, name = await checker.check(acc["fb_id"])
+            changed = status != acc["status"] and status != "unknown"
+            db.update_account(acc["id"], status=status, last_check=datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+            results.append((acc["fb_id"], acc["note"], status, changed))
+            await asyncio.sleep(0.5)
+
+        lines = ["📊 <b>Kết quả kiểm tra:</b>\n"]
+        for fb_id, note, status, changed in results:
+            e = status_emoji(status)
+            tag = " <i>(đổi)</i>" if changed else ""
+            lines.append(f"{e} <code>{fb_id}</code> {note}{tag}")
+        lines.append(f"\n<i>Cập nhật lúc: {datetime.now().strftime('%H:%M %d/%m/%Y')}</i>")
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard())
+
+
+# ─── UPDATE CONVERSATION ─────────────────────────────────────────────────────
+
+async def update_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    account_id = context.user_data.get("update_id")
+    if not account_id:
+        return ConversationHandler.END
+
+    acc = db.get_account_by_id(account_id)
+    parts = [p.strip() for p in update.message.text.split("|")]
+    note     = parts[0] if len(parts) > 0 and parts[0] else acc["note"]
+    price    = parts[1] if len(parts) > 1 and parts[1] else acc["price"]
+    deadline = parts[2] if len(parts) > 2 and parts[2] else acc["deadline"]
+
+    db.update_account(account_id, note=note, price=price, deadline=deadline)
+    acc = db.get_account_by_id(account_id)
+
+    await update.message.reply_text("✅ Đã cập nhật!")
+    await send_account_card(context.bot, update.effective_chat.id, acc)
+    return ConversationHandler.END
+
+
+# ─── MONITOR LOOP ─────────────────────────────────────────────────────────────
 
 async def monitor_loop(app: Application):
-    """Chạy ngầm, check tất cả accounts mỗi CHECK_INTERVAL giây."""
     logger.info("Monitor loop started")
-    await asyncio.sleep(10)  # chờ bot khởi động xong
+    await asyncio.sleep(15)
 
     while True:
         try:
-            accounts = db.get_all_accounts()
+            accounts = db.get_all_monitoring()
             logger.info(f"Checking {len(accounts)} accounts...")
 
-            for fb_id, name, old_status, user_id in accounts:
+            for acc in accounts:
                 try:
-                    new_status, display_name = await checker.check(fb_id)
+                    new_status, name = await checker.check(acc["fb_id"])
+                    if new_status == "unknown":
+                        await asyncio.sleep(1)
+                        continue
 
-                    if new_status != old_status:
-                        # Trạng thái thay đổi → thông báo
-                        db.update_status(fb_id, new_status, display_name)
-                        db.log_change(fb_id, old_status, new_status)
+                    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
-                        emoji = status_emoji(new_status)
-                        arrow = "🟢 LIVE" if new_status == "live" else "🔴 DIE"
-                        old_arrow = "🟢 LIVE" if old_status == "live" else "🔴 DIE"
+                    if new_status != acc["status"]:
+                        db.update_account(acc["id"], status=new_status, last_check=now)
+                        db.log_change(acc["fb_id"], acc["user_id"], acc["status"], new_status)
 
+                        old_e = status_emoji(acc["status"])
+                        new_e = status_emoji(new_status)
                         text = (
-                            f"🔔 *Cảnh báo thay đổi trạng thái!*\n\n"
-                            f"👤 *{display_name or name or fb_id}*\n"
-                            f"🆔 `{fb_id}`\n\n"
-                            f"{old_arrow} → {arrow}\n\n"
-                            f"🕐 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+                            f"🔔 <b>Thay đổi trạng thái!</b>\n\n"
+                            f"👤 <a href=\"https://facebook.com/{acc['fb_id']}\">{name or acc['fb_id']}</a>\n"
+                            f"🆔 <code>{acc['fb_id']}</code>\n"
+                            f"📝 {acc['note'] or '—'}\n\n"
+                            f"{old_e} <b>{status_label(acc['status'])}</b> → {new_e} <b>{status_label(new_status)}</b>\n\n"
+                            f"🕐 {now}"
                         )
 
-                        await app.bot.send_message(
-                            chat_id=user_id,
-                            text=text,
-                            parse_mode="Markdown"
-                        )
-                        logger.info(f"Status change: {fb_id} {old_status} -> {new_status}")
+                        # Gửi kèm avatar
+                        avatar_url = await checker.get_avatar_url(acc["fb_id"])
+                        try:
+                            await app.bot.send_photo(
+                                chat_id=acc["user_id"],
+                                photo=avatar_url,
+                                caption=text,
+                                parse_mode=ParseMode.HTML
+                            )
+                        except Exception:
+                            await app.bot.send_message(
+                                chat_id=acc["user_id"],
+                                text=text,
+                                parse_mode=ParseMode.HTML
+                            )
                     else:
-                        db.update_last_check(fb_id)
+                        db.update_account(acc["id"], last_check=now)
 
-                    await asyncio.sleep(1)  # tránh spam request
+                    await asyncio.sleep(1)
 
                 except Exception as e:
-                    logger.error(f"Error checking {fb_id}: {e}")
+                    logger.error(f"Error checking {acc['fb_id']}: {e}")
                     await asyncio.sleep(2)
 
         except Exception as e:
@@ -253,26 +469,45 @@ async def monitor_loop(app: Application):
         await asyncio.sleep(CHECK_INTERVAL)
 
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
     db.init()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Conversation: thêm UID
+    add_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_start),
+            CallbackQueryHandler(add_start, pattern="^add_new$"),
+        ],
+        states={
+            ASK_UID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+        per_message=False,
+    )
+
+    # Conversation: cập nhật
+    update_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(callback_handler, pattern="^update:")],
+        states={
+            ASK_UPDATE_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, update_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", add_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("checkall", cmd_checkall))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("menu",  cmd_start))
+    app.add_handler(add_conv)
+    app.add_handler(update_conv)
+    app.add_handler(CallbackQueryHandler(callback_handler))
 
     loop = asyncio.get_event_loop()
     loop.create_task(monitor_loop(app))
 
-    logger.info("Bot starting...")
+    logger.info("🤖 Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
 
